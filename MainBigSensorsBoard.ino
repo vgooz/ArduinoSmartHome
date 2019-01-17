@@ -11,74 +11,110 @@
     V6  GY-30 Light intensity value in lux
     V7  AM2320 Temperature
     V8  AM2320 Humidity
-    V9  Motion Alarms 
-    V10 Sound Alarms   
+    V9  Motion Alarms
+    V10 Sound Alarms
     V11 Widget LED for Red LED
     V12 Widget LED for Green LED
     V13 Widget LED Alarm
     V14 Widget LED Motion Alarm
     V15 Widget LED Sound Alarm
     V16 Widget LED Temperature Alarm
-    V17 Widget LED Gas Alarm    
+    V17 Widget LED Gas Alarm
+    V18 Outdor Sensor Battery Sate
+    V19 Outdor Sensor Signal Quality
+    V20 Outdor Sensor Last Package Received Ago
 */
 
 #include <BlynkSimpleStream.h>
 
-#include <VirtualWire.h>
 #include "DHT.h"
-//#include "Adafruit_AM2320.h"
 #include <Adafruit_BMP280.h>
 #include <MQ135.h>
-#include <BH1750.h>
+#include <Wire.h>
+//#include <BH1750.h>
 
-#define pinLEDRed       13
-#define pinLEDGreen     12
-#define pinRX           4
-#define pinMQ135        A7
-#define pinDMQ135       2     //Gas Sensor
-#define pinBuzzer       9
+#define pinRXINT        2
 #define pinSound        3
+#define pinDMQ135       4     //Gas Sensor
 #define pinRCWL         5     //Micro Wave Sensor
 #define DHTPIN          6
-#define pinGuard        7
-#define pinAlarm        8
-#define pinResetAlarms  10
+#define pinBuzzer       7
+#define pinBuzzerOn     8
+#define pinGuard        9
+#define pinAlarm        10
+
+#define pinLEDGreen     12
+#define pinLEDRed       13
+
+#define pinMQ135        A6
+#define I2C_ADDR        9
 
 #define DHTTYPE DHT11
 
 int RCWLLastState = LOW;
+int DMQ135LastState = LOW;
 
 bool guardEnabled = false;
-bool alarmsEnabled = false;
+bool alarmEnabled = false;
+
 int soundAlarms = 0;
 int motionAlarms = 0;
 int gasAlarms = 0;
-int tempHighAlarms = 0;
-int tempLowAlarms = 0;
+int highTempAlarms = 0;
+int lowTempAlarms = 0;
+int soundAlarmsPushed = 0;
+int motionAlarmsPushed = 0;
+bool newPackageReceived = 0;
 
-char auth[] = "8a057e8ddce448cbbffe85ff05c64dde";
-char DEVID[37];
+volatile bool soundDetected = false;
+bool motionDetected = false;
+bool gasDetected = false;
+bool highTempDetected = false;
+bool lowTempDetected = false;
 
-volatile unsigned long timeLEDRed = 0;
+unsigned long timeLEDRed = 0;
 unsigned long timeLEDGreen = 0;
 unsigned long timeBuzzer = 0;
 unsigned long timeAlarm = 0;
+unsigned long packageReceivedAgo = 0;
+volatile unsigned long timeEvent = 0;
 
-uint8_t buf[VW_MAX_MESSAGE_LEN];
-uint8_t buflen = VW_MAX_MESSAGE_LEN;
+char auth[] = "8a057e8ddce448cbbffe85ff05c64dde";
+
+struct package
+{
+  uint8_t sender;
+  uint8_t session;
+  uint8_t iteration;
+  uint8_t received;
+  uint8_t lost;
+  int16_t data1;
+  int16_t data2;
+  int16_t data3;
+};
+
+typedef struct package Package;
+Package data;
+
+uint8_t buflen = sizeof(data);
+
+volatile unsigned long timeRX = 0;
+
+float tBMPSum = 0, tDHTSum = 0, humiditySum = 0, gasSum = 0, pressureSum = 0;
+int tBMPCount = 0, tDHTCount = 0, humidityCount = 0, gasCount = 0, pressureCount = 0;
 
 Adafruit_BMP280 bmp; //I2C
-//Adafruit_AM2320 am2320 = Adafruit_AM2320();
 DHT dht(DHTPIN, DHTTYPE);
 MQ135 gasSensor = MQ135(pinMQ135);
-BH1750 lightMeter;
+//BH1750 lightMeter;
 
 bool BMP280Success;
-bool AM2320Success;
-bool BH1750Success;
+//bool BH1750Success;
 
 
-BlynkTimer timer;
+BlynkTimer pushTimer;
+BlynkTimer syncTimer;
+
 
 WidgetLED ledRed(V11);                //LED Red
 WidgetLED ledGreen(V12);              //LED Green
@@ -88,36 +124,187 @@ WidgetLED ledAlarmSound(V15);         //LED Alarm Sound
 WidgetLED ledAlarmTemperature(V16);   //LED Alarm Temperature
 WidgetLED ledAlarmGas(V17);           //LED Alarm Gas
 
+BLYNK_CONNECTED()
+{
+  ledRed.setValue(255 * digitalRead(pinLEDRed));
+  ledGreen.setValue(255 * digitalRead(pinLEDGreen));
+  ledAlarm.setValue(255 * digitalRead(pinAlarm));
+  ledAlarmMotion.setValue(255 * (int)motionDetected);
+  ledAlarmSound.setValue(255 * (int)soundDetected);
+  ledAlarmTemperature.setValue(255 * (int)(highTempDetected || lowTempDetected));
+  ledAlarmGas.setValue(255 * (int)gasDetected);
+  Blynk.virtualWrite(V9, motionAlarms);
+  Blynk.virtualWrite(V10, soundAlarms);
+  motionAlarmsPushed = motionAlarms;
+  soundAlarmsPushed = soundAlarms;
+  Blynk.syncAll();
+}
+
+
+void onSoundDetect()
+{
+  soundDetected = true;
+  timeEvent = millis();
+}
+
+void onPackageReceived()
+{
+  timeRX = millis();
+}
+
 void setup()
 {
   pinMode(pinLEDRed, OUTPUT);
   pinMode(pinLEDGreen, OUTPUT);
   pinMode(pinBuzzer, OUTPUT);
-  pinMode(pinSound, INPUT);
-  pinMode(pinRCWL, INPUT);
-  pinMode(pinGuard, INPUT);
-  pinMode(pinAlarm, INPUT);
-  pinMode(pinResetAlarms, INPUT);
+  pinMode(pinDMQ135, INPUT);
+  pinMode(pinBuzzerOn, INPUT);
 
-  vw_setup(400);
-  vw_set_rx_pin(pinRX);
-  vw_rx_start();
-  //  AM2320Success = am2320.begin();
   dht.begin();
-  BMP280Success = bmp.begin(0x76); //0x76 I2C Address
-  BH1750Success = lightMeter.begin();
+  BMP280Success = bmp.begin(0x76);    //0x76 I2C Address
+  Wire.begin();
+  //  BH1750Success = lightMeter.begin();
 
-  attachInterrupt(1, SoundDetected, RISING);
+  attachInterrupt(0, onPackageReceived, RISING);
+  attachInterrupt(1, onSoundDetect, RISING);
+
+  pushTimer.setInterval(1000L, pushData);
+  syncTimer.setInterval(100L, syncState);
 
   Serial.begin(9600);
   Blynk.begin(Serial, auth);
-
-  timer.setInterval(1000L, myTimerEvent);
 }
 
-BLYNK_CONNECTED()
+void loop()
 {
-  Blynk.syncAll();
+  unsigned long timeMillis = millis();
+
+  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 500)
+  {
+    timeLEDGreen = 0;
+    digitalWrite(pinLEDGreen, LOW);
+  }
+
+  int RCWLState = digitalRead(pinRCWL);
+  if (RCWLState != RCWLLastState)
+  {
+    if (RCWLState == HIGH)
+    {
+      motionDetected = true;
+      timeEvent = timeMillis;
+    }
+    RCWLLastState = RCWLState;
+  }
+
+  int DMQ135State = digitalRead(pinDMQ135);
+  if (DMQ135State != DMQ135LastState)
+  {
+    if (DMQ135State == HIGH) gasDetected = true;
+    else gasDetected = false;
+    DMQ135LastState = DMQ135State;
+  }
+
+  if (timeRX > 0 && timeMillis - timeRX > 3000)
+  {
+    timeRX = 0;
+    digitalWrite(pinLEDGreen, HIGH);
+    timeLEDGreen = timeMillis;
+
+    Wire.beginTransmission(I2C_ADDR);
+    if (Wire.endTransmission() == 0)
+    {
+      Wire.requestFrom(I2C_ADDR, (int)buflen);      // Request N bytes from slave
+      uint8_t bytes = Wire.available();
+      if (bytes == buflen)
+      {
+        uint8_t buf[sizeof(data)];
+        for (int i = 0; i < buflen; i++) buf[i] = Wire.read();
+        CopyBufferToPackage(buf);
+        newPackageReceived = true;
+      }
+    }
+  }
+
+  int guardState = digitalRead(pinGuard);
+
+  if (guardState == HIGH && !guardEnabled)
+  {
+    guardEnabled = true;
+    ResetAlarms();
+    timeLEDRed = 1;
+    digitalWrite(pinLEDRed, HIGH);
+  }
+  else if (guardEnabled && guardState == LOW)
+  {
+    guardEnabled = false;
+    DisableAlarm();
+  }
+
+  if (guardEnabled && !alarmEnabled)
+  {
+    if (soundDetected || motionDetected) alarmEnabled = true;
+    if (soundDetected) soundAlarms++;
+    if (motionDetected) motionAlarms++;
+  }
+  else if (!alarmEnabled)
+  {
+    if (gasDetected || highTempDetected || lowTempDetected) alarmEnabled = true;
+    if (gasDetected) gasAlarms++;
+    if (highTempDetected) highTempAlarms++;
+    if (lowTempDetected) lowTempAlarms++;
+  }
+
+  if (alarmEnabled && timeAlarm == 0)
+    EnableAlarm();
+  else if (alarmEnabled && timeMillis - timeAlarm > 15000)
+    DisableAlarm();
+  else if (alarmEnabled)
+  {
+    BeepBuzzer(500);
+    BlinkRed(500);
+  }
+  else if (!alarmEnabled && (soundAlarms > 0 || motionAlarms > 0 || gasAlarms > 0 || highTempAlarms > 0 || lowTempAlarms > 0))
+  {
+    BlinkRed(1000);
+    if (timeMillis - timeEvent > 500)
+    {
+      motionDetected = false;
+      soundDetected = false;
+      timeEvent = 0;
+    }
+  }
+  else if (!guardEnabled)
+  {
+    if ((motionDetected || soundDetected) && timeLEDRed == 0)
+    {
+      digitalWrite(pinLEDRed, HIGH);
+      timeLEDRed = timeMillis;
+    }
+    if (timeLEDRed > 0 && timeMillis - timeLEDRed > 500)
+    {
+      digitalWrite(pinLEDRed, LOW);
+      timeLEDRed = 0;
+      motionDetected = false;
+      soundDetected = false;
+      timeEvent = 0;
+    }
+  }
+
+  Blynk.run();
+  pushTimer.run();
+  syncTimer.run();
+}
+
+void CopyBufferToPackage(uint8_t *arr)
+{
+  data.sender = arr[0];
+  data.session = arr[1];
+  data.iteration = arr[2];
+  data.received = arr[3];
+  data.lost = arr[4];
+  data.data1 = arr[5] | arr[6] << 8;
+  data.data2 = arr[7] | arr[8] << 8;
+  data.data3 = arr[9] | arr[10] << 8;
 }
 
 void ResetAlarms()
@@ -126,106 +313,206 @@ void ResetAlarms()
   soundAlarms = 0;
   motionAlarms = 0;
   gasAlarms = 0;
-  tempHighAlarms = 0;
-  tempLowAlarms = 0;
-  Blynk.virtualWrite(V9, motionAlarms);
-  Blynk.virtualWrite(V10, soundAlarms);
+  highTempAlarms = 0;
+  lowTempAlarms = 0;
 }
 
 void EnableAlarm()
 {
   timeAlarm = millis();
   digitalWrite(pinAlarm, HIGH);
-  ledAlarm.on();
 }
 
 void DisableAlarm()
 {
   timeAlarm = 0;
+  alarmEnabled = false;
+  soundDetected = false;
+  motionDetected = false;
   digitalWrite(pinAlarm, LOW);
   digitalWrite(pinBuzzer, LOW);
-  ledAlarm.off();
-  ledAlarmMotion.off();
-  ledAlarmSound.off();
-  ledAlarmTemperature.off();
-  ledAlarmGas.off();
   if (guardEnabled)
   {
+    timeLEDRed = 1;
     digitalWrite(pinLEDRed, HIGH);
-    ledRed.on();
-  }  
+  }
   else
   {
     timeLEDRed = 0;
     digitalWrite(pinLEDRed, LOW);
-    ledRed.off();
   }
 }
 
-void SoundDetected()
+
+void syncState()
 {
-  timeLEDRed = 2;
+  int ledRedState = digitalRead(pinLEDRed);
+
+  if (ledRedState == HIGH && ledRed.getValue() == 0)
+    ledRed.on();
+  else if (ledRedState == LOW && ledRed.getValue() == 255)
+    ledRed.off();
+
+  if (timeLEDGreen > 0 && ledGreen.getValue() == 0)
+    ledGreen.on();
+  else if (timeLEDGreen == 0 && ledGreen.getValue() == 255)
+    ledGreen.off();
+
+  if (alarmEnabled && ledAlarm.getValue() == 0)
+    ledAlarm.on();
+  if (!alarmEnabled && ledAlarm.getValue() == 255)
+    ledAlarm.off();
+
+  if (soundDetected && ledAlarmSound.getValue() == 0)
+    ledAlarmSound.on();
+  if (!soundDetected && ledAlarmSound.getValue() == 255)
+    ledAlarmSound.off();
+
+  if (motionDetected && ledAlarmMotion.getValue() == 0)
+    ledAlarmMotion.on();
+  if (!motionDetected && ledAlarmMotion.getValue() == 255)
+    ledAlarmMotion.off();
+
+  if (gasDetected && ledAlarmGas.getValue() == 0)
+    ledAlarmGas.on();
+  if (!gasDetected && ledAlarmGas.getValue() == 255)
+    ledAlarmGas.off();
+
+  if ((highTempDetected || lowTempDetected) && ledAlarmTemperature.getValue() == 0)
+    ledAlarmTemperature.on();
+  if (!highTempDetected && !lowTempDetected && ledAlarmTemperature.getValue() == 255)
+    ledAlarmTemperature.off();
 }
 
-void myTimerEvent()
+void processTH(float t, float h)
 {
-  float t = -100, h = -1;
+  if (isnan(t)) return;
+
+  if (t < 15.0 && !lowTempDetected)
+  {
+    lowTempDetected = true;
+    lowTempAlarms++;
+  }
+  else if (t > 26.0 && !highTempDetected)
+  {
+    highTempDetected = true;
+    highTempAlarms++;
+  }
+  else if (lowTempDetected && t >= 15.0)
+  {
+    lowTempDetected = false;
+  }
+  else if (highTempDetected && t <= 26.0)
+  {
+    highTempDetected = false;
+  }
+
+  if (isnan(h)) return;
+
+  gasSum += gasSensor.getCorrectedPPM(t, h);
+  gasCount++;
+  if (gasCount > 59)
+  {
+    Blynk.virtualWrite(V3, gasSum / gasCount);
+    gasSum = 0;
+    gasCount = 0;
+  }
+}
+
+void pushData()
+{
+
+  float h = dht.readHumidity();
+  if (!isnan(h))
+  {
+    humiditySum += h;
+    humidityCount++;
+
+    if (humidityCount > 59)
+    {
+      Blynk.virtualWrite(V1, humiditySum / humidityCount);
+      humiditySum = 0;
+      humidityCount = 0;
+    }
+  }
+
+  float t = dht.readTemperature();
+  if (!isnan(t))
+  {
+    tDHTSum += t;
+    tDHTCount++;
+
+    if (tDHTCount > 59)
+    {
+      Blynk.virtualWrite(V4, tDHTSum / tDHTCount);
+      tDHTSum = 0;
+      tDHTCount = 0;
+    }
+  }
 
   if (BMP280Success)
   {
-    t = bmp.readTemperature();
+    float tBMP = bmp.readTemperature();
+    tBMPSum += tBMP;
+    tBMPCount++;
 
-    Blynk.virtualWrite(V0, t);
-
-    Blynk.virtualWrite(V5, bmp.readPressure() * 0.007501);
-
-    // Serial.print(bmp.readAltitude(1013.25)); // this should be adjusted to your local forcase
-  }
-
-  Blynk.virtualWrite(V4, dht.readTemperature());
-
-  h = dht.readHumidity();
-  Blynk.virtualWrite(V1, h);
-
-  /*
-    if (AM2320Success)
+    if (tBMPCount > 59)
     {
-      t = am2320.readTemperature();
-      Blynk.virtualWrite(V0, t);
-
-      h = am2320.readHumidity();
-      Blynk.virtualWrite(V1, h);
+      Blynk.virtualWrite(V0, tBMPSum / tBMPCount);
+      tBMPSum = 0;
+      tBMPCount = 0;
     }
-  */
+
+    pressureSum += bmp.readPressure() * 0.007501;
+    pressureCount++;
+
+    if (pressureCount > 59)
+    {
+      Blynk.virtualWrite(V5, pressureSum / pressureCount);
+      pressureSum = 0;
+      pressureCount = 0;
+    }
+    processTH(tBMP, h);
+  }
+  else
+  {
+    processTH(t, h);
+  }
 
   Blynk.virtualWrite(V2, gasSensor.getPPM());
 
-  if (t > -100 && h > 0)
+  //  if (BH1750Success)
+  //    Blynk.virtualWrite(V6, lightMeter.readLightLevel());
+
+  if (motionAlarmsPushed != motionAlarms)
   {
-    float ppm = gasSensor.getCorrectedPPM(t, h);
-    Blynk.virtualWrite(V3, ppm);
-    if (t > 26.0)
-    {
-      tempHighAlarms++;
-      EnableAlarm();
-      ledAlarmTemperature.on();
-    }
-    else if (t < 15.0)
-    {
-      tempLowAlarms++;
-      EnableAlarm();
-      ledAlarmTemperature.on();
-    }
-    if (ppm > 1000.0)
-    {
-      gasAlarms++;
-      EnableAlarm();
-      ledAlarmGas.on();
-    }
+    Blynk.virtualWrite(V9, motionAlarms);
+    motionAlarmsPushed = motionAlarms;
   }
 
-  if (BH1750Success)
-    Blynk.virtualWrite(V6, lightMeter.readLightLevel());
+  if (soundAlarmsPushed != soundAlarms)
+  {
+    Blynk.virtualWrite(V10, soundAlarms);
+    soundAlarmsPushed = soundAlarms;
+  }
+
+  if (newPackageReceived && data.sender == 111)
+  {
+    Blynk.virtualWrite(V7, data.data1 / 10.0);
+    Blynk.virtualWrite(V8, data.data2 / 10.0);
+    Blynk.virtualWrite(V18, data.data3 / 1000.0);
+    if (data.received + data.lost > 0)
+      Blynk.virtualWrite(V19, ((float)data.received / (float)(data.received + data.lost)) * 100.0);
+    else
+      Blynk.virtualWrite(V19, 0.0);
+    packageReceivedAgo = 0;
+    newPackageReceived = false;
+  }
+  else
+  {
+    packageReceivedAgo++;      
+  }
+  Blynk.virtualWrite(V20, packageReceivedAgo);
 }
 
 
@@ -238,20 +525,26 @@ void BlinkRed(int blinkDelay)
   {
     digitalWrite(pinLEDRed, HIGH);
     timeLEDRed = timeMillis;
-    ledRed.on();
   }
   else if (ledRedState == HIGH && timeMillis - timeLEDRed > blinkDelay)
   {
     digitalWrite(pinLEDRed, LOW);
     timeLEDRed = timeMillis;
-    ledRed.off();
   }
 }
 
 void BeepBuzzer(int beepDelay)
 {
-  unsigned long timeMillis = millis();
   int buzzerState = digitalRead(pinBuzzer);
+
+  if (digitalRead(pinBuzzerOn) == LOW)
+  {
+    if (buzzerState = HIGH)
+      digitalWrite(pinBuzzer, LOW);
+    return;
+  }
+
+  unsigned long timeMillis = millis();
 
   if (buzzerState == LOW && timeMillis - timeBuzzer > beepDelay)
   {
@@ -263,112 +556,4 @@ void BeepBuzzer(int beepDelay)
     digitalWrite(pinBuzzer, LOW);
     timeBuzzer = timeMillis;
   }
-}
-
-void loop()
-{
-
-  unsigned long timeMillis = millis();
-
-  if (digitalRead(pinResetAlarms) == HIGH) ResetAlarms();
-
-  int guardState = digitalRead(pinGuard);
-
-  if (guardState == HIGH && !guardEnabled)
-  {
-    guardEnabled = true;
-    ResetAlarms();
-  }
-  else if (guardEnabled && guardState == LOW)
-  {
-    guardEnabled = false;
-    DisableAlarm();
-  }
-
-  if (guardEnabled && timeAlarm == 0)
-  {
-    if (timeLEDRed == 2)
-    {
-      soundAlarms++;
-      EnableAlarm();
-      ledAlarmSound.on();
-      Blynk.virtualWrite(V10, soundAlarms);
-    }
-    int RCWLState = digitalRead(pinRCWL);
-    if (RCWLState != RCWLLastState)
-    {
-      if (RCWLState == HIGH)
-      {
-        motionAlarms++;
-        EnableAlarm();
-        ledAlarmMotion.on();
-        Blynk.virtualWrite(V9, motionAlarms);
-      }
-      RCWLLastState = RCWLState;
-    }
-  }
-
-  if (timeAlarm > 2 && timeMillis - timeAlarm > 15000)
-  {
-    DisableAlarm();
-  }
-  
-  else if (timeAlarm > 2)
-  {
-    BeepBuzzer(300);
-    BlinkRed(300);
-  }
-  else if (timeAlarm == 0 && (soundAlarms > 0 || motionAlarms > 0 || tempHighAlarms > 0 || tempLowAlarms > 0 || gasAlarms > 0))
-  {
-    BlinkRed(1000);
-  }
-  else if (!guardEnabled)
-  {
-    if (timeLEDRed == 0 && digitalRead(pinRCWL) == HIGH)
-    {
-      digitalWrite(pinLEDRed, HIGH);
-      timeLEDRed = 1;
-      ledRed.on();
-      ledAlarmMotion.on();
-    }
-    else if (timeLEDRed == 1 && digitalRead(pinRCWL) == LOW)
-    {
-      digitalWrite(pinLEDRed, LOW);
-      timeLEDRed = 0;
-      ledRed.off();
-      ledAlarmMotion.off();
-    }
-    else if (timeLEDRed == 2)
-    {
-      digitalWrite(pinLEDRed, HIGH);
-      timeLEDRed = timeMillis;
-      ledRed.on();
-      ledAlarmSound.on();
-    }
-    else if (timeLEDRed > 2 && timeMillis - timeLEDRed > 300)
-    {
-      digitalWrite(pinLEDRed, LOW);
-      timeLEDRed = 0;
-      ledRed.off();
-      ledAlarmSound.off();
-    }
-  }
-
-  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 500)
-  {
-    digitalWrite(pinLEDGreen, LOW);
-    timeLEDGreen = 0;
-    ledGreen.off();
-  }
-
-  if (vw_get_message(buf, &buflen)) // Non-blocking
-  {
-    timeLEDGreen = timeMillis;
-    digitalWrite(pinLEDGreen, HIGH);
-    memcpy(&DEVID, &buf, buflen);
-    ledGreen.on();
-  }
-
-  Blynk.run();
-  timer.run();
 }
