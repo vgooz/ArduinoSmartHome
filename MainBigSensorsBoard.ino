@@ -64,7 +64,7 @@ int highTempAlarms = 0;
 int lowTempAlarms = 0;
 int soundAlarmsPushed = 0;
 int motionAlarmsPushed = 0;
-bool newPackageReceived = 0;
+bool newPackageReceived = false;
 
 volatile bool soundDetected = false;
 bool motionDetected = false;
@@ -83,14 +83,9 @@ char auth[] = "8a057e8ddce448cbbffe85ff05c64dde";
 
 struct package
 {
-  uint8_t sender;
-  uint8_t session;
-  uint8_t iteration;
+  uint8_t sender: 4, session: 2, type: 2;
   uint8_t received;
-  uint8_t lost;
-  int16_t data1;
-  int16_t data2;
-  int16_t data3;
+  uint16_t value;
 };
 
 typedef struct package Package;
@@ -179,7 +174,7 @@ void loop()
 {
   unsigned long timeMillis = millis();
 
-  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 500)
+  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 1000)
   {
     timeLEDGreen = 0;
     digitalWrite(pinLEDGreen, LOW);
@@ -204,25 +199,12 @@ void loop()
     DMQ135LastState = DMQ135State;
   }
 
-  if (timeRX > 0 && timeMillis - timeRX > 3000)
+  if (timeRX > 0 && timeMillis - timeRX > 2500)
   {
     timeRX = 0;
     digitalWrite(pinLEDGreen, HIGH);
     timeLEDGreen = timeMillis;
-
-    Wire.beginTransmission(I2C_ADDR);
-    if (Wire.endTransmission() == 0)
-    {
-      Wire.requestFrom(I2C_ADDR, (int)buflen);      // Request N bytes from slave
-      uint8_t bytes = Wire.available();
-      if (bytes == buflen)
-      {
-        uint8_t buf[sizeof(data)];
-        for (int i = 0; i < buflen; i++) buf[i] = Wire.read();
-        CopyBufferToPackage(buf);
-        newPackageReceived = true;
-      }
-    }
+    newPackageReceived = true;
   }
 
   int guardState = digitalRead(pinGuard);
@@ -293,18 +275,6 @@ void loop()
   Blynk.run();
   pushTimer.run();
   syncTimer.run();
-}
-
-void CopyBufferToPackage(uint8_t *arr)
-{
-  data.sender = arr[0];
-  data.session = arr[1];
-  data.iteration = arr[2];
-  data.received = arr[3];
-  data.lost = arr[4];
-  data.data1 = arr[5] | arr[6] << 8;
-  data.data2 = arr[7] | arr[8] << 8;
-  data.data3 = arr[9] | arr[10] << 8;
 }
 
 void ResetAlarms()
@@ -421,7 +391,6 @@ void processTH(float t, float h)
 
 void pushData()
 {
-
   float h = dht.readHumidity();
   if (!isnan(h))
   {
@@ -496,23 +465,55 @@ void pushData()
     soundAlarmsPushed = soundAlarms;
   }
 
-  if (newPackageReceived && data.sender == 111)
+  if (newPackageReceived)
   {
-    Blynk.virtualWrite(V7, data.data1 / 10.0);
-    Blynk.virtualWrite(V8, data.data2 / 10.0);
-    Blynk.virtualWrite(V18, data.data3 / 1000.0);
-    if (data.received + data.lost > 0)
-      Blynk.virtualWrite(V19, ((float)data.received / (float)(data.received + data.lost)) * 100.0);
-    else
-      Blynk.virtualWrite(V19, 0.0);
-    packageReceivedAgo = 0;
     newPackageReceived = false;
-  }
-  else
-  {
-    packageReceivedAgo++;      
+    packageReceivedAgo = 0;
+
+    Wire.beginTransmission(I2C_ADDR);
+    if (Wire.endTransmission() == 0)
+    {
+      Wire.requestFrom(I2C_ADDR, (int)buflen);      // Request N bytes from slave
+      uint8_t bytes = Wire.available();
+      if (bytes == buflen)
+      {
+        uint8_t buf[sizeof(data)];
+        for (int i = 0; i < buflen; i++) buf[i] = Wire.read();
+
+        data.sender = buf[0] & 0xf;
+        data.session = (buf[0] >> 4) & 0x3;
+        data.type = (buf[0] >> 6) & 0x3;
+        data.received = buf[1];
+        data.value = buf[2] | buf[3] << 8;
+
+        if (data.sender == 1)
+        {
+          switch (data.type)
+          {
+            case 0:
+              Blynk.virtualWrite(V18, data.value / 1000.0);
+              break;
+            case 1:
+              if (data.value != 0xFFFF)
+              {
+                if (data.value & 0x8000) Blynk.virtualWrite(V7, -(int16_t)(data.value & 0x7fff) / 10.0);
+                else Blynk.virtualWrite(V7, data.value / 10.0);
+              }
+              break;
+            case 2:
+              if (data.value != 0xFFFF)
+              {
+                Blynk.virtualWrite(V8, data.value / 10.0);
+              }
+              break;
+          }
+          Blynk.virtualWrite(V19, (float)data.received / 33.0 * 100.0);
+        }
+      }
+    }
   }
   Blynk.virtualWrite(V20, packageReceivedAgo);
+  packageReceivedAgo++;
 }
 
 

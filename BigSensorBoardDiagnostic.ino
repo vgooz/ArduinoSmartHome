@@ -30,14 +30,9 @@ MQ135 gasSensor = MQ135(pinMQ135);
 
 struct package
 {
-  uint8_t sender;
-  uint8_t session;
-  uint8_t iteration;
+  uint8_t sender: 4, session: 2, type: 2;  
   uint8_t received;
-  uint8_t lost;
-  int16_t data1;
-  int16_t data2;
-  int16_t data3;
+  uint16_t value;
 };
 
 typedef struct package Package;
@@ -116,7 +111,7 @@ void loop() {
     digitalWrite(pinBuzzer, LOW);
   }
   
-  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 500)
+  if (timeLEDGreen > 0 && timeMillis - timeLEDGreen > 1000)
   {
     timeLEDGreen = 0;
     digitalWrite(pinLEDGreen, LOW);
@@ -139,7 +134,13 @@ void loop() {
       {
         uint8_t buf[sizeof(data)];
         for (int i = 0; i < buflen; i++) buf[i] = Wire.read();
-        CopyBufferToPackage(buf);
+
+        data.sender = buf[0] & 0xf;
+        data.session = (buf[0] >> 4) & 0x3;
+        data.type = (buf[0] >> 6) & 0x3;
+        data.received = buf[1];
+        data.value = buf[2] | buf[3] << 8;
+
         Serial.print("Received package! buflen: ");
         Serial.print(buflen);
         Serial.print("; bytes: ");
@@ -148,24 +149,39 @@ void loop() {
         Serial.print(data.sender);
         Serial.print("; Session: ");
         Serial.print(data.session);
-        Serial.print("; Iteration: ");
-        Serial.print(data.iteration);
         Serial.print("; Received: ");
         Serial.print(data.received);
-        Serial.print("; Lost: ");
-        Serial.print(data.lost);
-        Serial.print("; Data1: ");
-        Serial.print(data.data1);
-        Serial.print("; Data2: ");
-        Serial.print(data.data2);
-        Serial.print("; Data3: ");
-        Serial.print(data.data3);
+        Serial.print("; Data");
+        Serial.print(data.type);
+        Serial.print(": ");
+        Serial.print(data.value);
         Serial.print("; Quality: ");
-        if (data.received + data.lost > 0)
-          Serial.print(((float)data.received / (float)(data.received + data.lost)) * 100.0);
-        else
-          Serial.print("0.00");
+        Serial.print((float)data.received / 33.0 * 100.0);
         Serial.println("%");
+        if (data.sender == 1)
+        {
+          switch (data.type)
+          {
+            case 0:
+              Serial.print("Sensor Voltage = ");
+              Serial.print(data.value / 1000.0);
+              Serial.println("V");
+              break;
+            case 1:
+              Serial.print("Sensor t = ");
+              if (data.value == 0xFFFF) Serial.print("NAN");
+              else if (data.value & 0x8000) Serial.print(-(int16_t)(data.value & 0x7fff) / 10.0);
+              else Serial.print(data.value / 10.0);
+              Serial.println("*C");
+              break;
+            case 2:
+              Serial.print("Sensor h = ");
+              if (data.value == 0xFFFF) Serial.print("NAN");
+              else Serial.print(data.value / 10.0);
+              Serial.println("%");
+              break;
+          }
+        }        
       }
       else
       {
@@ -193,16 +209,4 @@ void loop() {
     Serial.println(gasSensor.getPPM());
     timeMeasuring = timeMillis;
   }
-}
-
-void CopyBufferToPackage(uint8_t *arr)
-{
-  data.sender = arr[0];   
-  data.session = arr[1];
-  data.iteration = arr[2];
-  data.received = arr[3];
-  data.lost = arr[4];
-  data.data1 = arr[5] | arr[6] << 8;
-  data.data2 = arr[7] | arr[8] << 8;
-  data.data3 = arr[9] | arr[10] << 8;
 }
