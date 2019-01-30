@@ -1,17 +1,23 @@
 //AM2320 1(VDD), 2(SDA), 3(GND), 4(SCL)
 //P0(SDA), P2(SCL)
+
 #include <avr/sleep.h>
+#include <avr/wdt.h>
 #include <avr/power.h>
 #include <VirtualWire.h>
 #include <Wire.h>
 
-#define pinLED  1
-#define pinTX   3
+#define aca_disable() (ACSR |= _BV(ACD))
+#define adc_disable() (ADCSRA &= ~_BV(ADEN))
+#define adc_enable()  (ADCSRA |=  _BV(ADEN))
 
 #define AM2320_CMD_READREG    0x03  ///< read register command
 #define AM2320_REG_TEMP_H     0x02  ///< temp register address
 #define AM2320_REG_HUM_H      0x00  ///< humidity register address
 #define AM2320_I2C_ADDR       0x5C
+
+#define TX_PIN  4     //pin where your transmitter is connected
+#define LED_PIN 1     //pin for blinking LED
 #define TX_SPEED              2048
 
 struct package
@@ -24,105 +30,100 @@ typedef struct package Package;
 Package data;
 uint8_t buflen = sizeof(data);
 uint8_t buf[sizeof(data)];
-uint8_t session;
-uint8_t iteration;
 
-volatile byte f_wdt = 1;
+volatile byte watchdog_counter = 0;
+
+ISR(WDT_vect)
+{
+  WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
+  watchdog_counter++;
+}
+
+void initializeWatchdogTimer(byte sleep_time)
+{
+  wdt_reset();
+  wdt_enable(sleep_time);
+  WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
+}
 
 void setup()
 {
-  DDRB |= (1 << PB1);      //replaces pinMode(pinLED, OUTPUT);
-  data.sender = 1;
-  vw_set_tx_pin(pinTX);
+  pinMode(LED_PIN, OUTPUT);
+  initializeWatchdogTimer(WDTO_8S);
+  vw_set_ptt_inverted(false);
+  vw_set_tx_pin(TX_PIN);
   vw_setup(TX_SPEED);
   Wire.begin();
+  data.sender = 1;
 
-  // Setup the WDT
-  MCUSR &= ~(1 << WDRF);                              // Clear the reset flag
-
-  // In order to change WDE or the prescaler, we need to
-  // set WDCE (This will allow updates for 4 clock cycles).
-  WDTCR |= (1 << WDCE) | (1 << WDE);
-  WDTCR = 1 << WDP0 | 1 << WDP3;                      // set new watchdog timeout prescaler value 8.0 seconds
-  WDTCR |= _BV(WDIE);                                 // Enable the WD interrupt (note no reset).
-}
-
-void loop()
-{
-  static int awake_counter = 1;
-  if (f_wdt == 1) {
-    f_wdt = 0;
-    --awake_counter;
-    if (awake_counter <= 0) {                         // Send Weather data
-      awake_counter = 5;                              //40 Sec
-
-      PORTB |= (1 << PB1);      //replaces digitalWrite(pinLED, HIGH);
-      
-      iteration = 0;
-      if (session % 5 == 0)
-      {
-        data.type = 0;
-        data.value = (float)readVcc();
-      }
-      else if (session % 3 == 0)
-      {
-          data.type = 2;
-          data.value = am2320_readRegister16(AM2320_REG_HUM_H);
-      }
-      else
-      {
-          data.type = 1;
-          data.value = am2320_readRegister16(AM2320_REG_TEMP_H);
-      }
-            
-      buf[0] = data.sender | data.session << 4 | data.type << 6;
-      buf[1] = data.value & 0xff;
-      buf[2] = (data.value >> 8) & 0xff;
-
-      while(iteration < 33)
-      {
-        vw_send((uint8_t *)&buf, buflen);
-        vw_wait_tx();
-        iteration++;
-        delay(5);
-      }
-
-      data.session++;
-      data.type++;
-
-      session++;
-
-      PORTB &= ~(1 << PB1);    //replaces digitalWrite(pinLED, LOW);
-    }
-    enterSleep();
-  }
-}
-
-ISR(WDT_vect) {
-  if (f_wdt == 0) f_wdt = 1;
-}
-
-void enterSleep(void) {
+  aca_disable();
+  adc_disable();
+//(conflict with I2C)  DIDR0 = 0x3F; //Disable digital input buffers on all ADC0-ADC5 pins.
   power_all_disable();
-  ADCSRA &= ~(1 << ADEN);                             // disable ADC
-  set_sleep_mode(SLEEP_MODE_PWR_DOWN);                // the lowest power consumption
-  sleep_enable();
-  sleep_cpu();                                        // Now enter sleep mode.
-
-  // The program will continue from here after the WDT timeout.
-  sleep_disable();                                    // First thing to do is disable sleep.
-  power_all_enable();                                 // Re-enable the peripherals.
-  ADCSRA |= 1 << ADEN;                                // enable ADC
 }
 
-uint16_t readVcc(void) 
+void loop() {
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+  sleep_enable();
+  sleep_bod_disable();
+  sleep_cpu();
+
+  // wake up here every 8 secs, counter was incremented by ISR
+  if (watchdog_counter < 5 ) return; // wait for 5 * 8 seconds
+  watchdog_counter = 0;
+
+  sleep_disable();
+
+  power_all_enable();
+  adc_enable();
+
+  PORTB |= (1 << PB1);      //replaces digitalWrite(pinLED, HIGH);
+
+  if (data.session % 5 == 0)
+  {
+    data.type = 0;
+    data.value = (float)readVcc();
+  }
+  else if (data.session % 3 == 0)
+  {
+    data.type = 2;
+    data.value = am2320_readRegister16(AM2320_REG_HUM_H);
+  }
+  else
+  {
+    data.type = 1;
+    data.value = am2320_readRegister16(AM2320_REG_TEMP_H);
+  }
+
+  buf[0] = data.sender | data.session << 4 | data.type << 6;
+  buf[1] = data.value & 0xff;
+  buf[2] = (data.value >> 8) & 0xff;
+
+  uint8_t iteration = 0;
+
+  while (iteration < 33)
+  {
+    vw_send((uint8_t *)&buf, buflen);
+    vw_wait_tx();
+    iteration++;
+  }
+  
+  data.session++;
+
+  PORTB &= ~(1 << PB1);    //replaces digitalWrite(pinLED, LOW);
+
+  adc_disable();
+  power_all_disable();
+}
+
+uint16_t readVcc(void)
 {
   uint16_t result;
   // Read 1.1V reference against Vcc
-  ADMUX = (0<<REFS0) | (12<<MUX0);
+  ADMUX = (0 << REFS0) | (12 << MUX0);
   delay(2); // Wait for Vref to settle
-  ADCSRA |= (1<<ADSC); // Convert
-  while (bit_is_set(ADCSRA,ADSC));
+  ADCSRA |= (1 << ADSC); // Convert
+  while (bit_is_set(ADCSRA, ADSC));
   result = ADCW;
   return 1125300L / result; // Back-calculate AVcc in mV
 }
