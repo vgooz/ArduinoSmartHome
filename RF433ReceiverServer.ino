@@ -1,5 +1,6 @@
 //P0(SDA), P2(SCL)
 
+#include <avr/wdt.h>
 #include <VirtualWire.h>
 #include <TinyWireS.h>
 
@@ -15,49 +16,28 @@
 
 uint8_t prevSender = 0;
 
-volatile unsigned long timeRXINT = 0;
-
 uint8_t bufI2C[i2cBufLen];
 
 void setup() {
   DDRB |= (1 << PB1);      //replaces pinMode(pinLED, OUTPUT);
   DDRB |= (1 << PB4);      //replaces pinMode(pinRXIN, OUTPUT);
+  initializeWatchdogTimer(WDTO_2S);
   vw_set_rx_pin(pinRX);
   vw_setup(RX_SPEED);
   vw_rx_start();
   TinyWireS.begin(I2C_ADDR);
   TinyWireS.onRequest(requestEvent);
-  setup_watchdog(7);      //set watchdog time in 2sec
 }
 
 ISR(WDT_vect) {
-  if (timeRXINT > 0 && millis() - timeRXINT > 2000)
-  {
-    PORTB &= ~(1 << PB1);    //replaces digitalWrite(pinLED, LOW);
-    PORTB &= ~(1 << PB4);    //replaces digitalWrite(pinLED, LOW);
-    timeRXINT = 0;
-  }
+  PORTB &= ~(1 << PB1);    //replaces digitalWrite(pinLED, LOW);
+  PORTB &= ~(1 << PB4);    //replaces digitalWrite(pinLED, LOW);
 }
 
-//****************************************************************
-// 0=16ms, 1=32ms,2=64ms,3=128ms,4=250ms,5=500ms
-// 6=1 sec,7=2 sec, 8=4 sec, 9= 8sec
-void setup_watchdog(int ii)
+void initializeWatchdogTimer(byte sleep_time)
 {
-  byte bb;
-  int ww;
-  if (ii > 9 ) ii = 9;
-  bb = ii & 7;
-  if (ii > 7) bb |= (1 << 5);
-  bb |= (1 << WDCE);
-  ww = bb;
-
-  MCUSR &= ~(1 << WDRF);
-  // start timed sequence
-  WDTCR |= (1 << WDCE) | (1 << WDE);
-  // set new watchdog timeout value
-  WDTCR = bb;
-  WDTCR |= _BV(WDIE);
+  wdt_reset();
+  wdt_enable(sleep_time);
 }
 
 void requestEvent()
@@ -78,7 +58,7 @@ void loop()
     {
       PORTB |= (1 << PB1);      //replaces digitalWrite(pinLED, HIGH);
       PORTB |= (1 << PB4);      //replaces digitalWrite(pinRXINT, HIGH);
-      timeRXINT = millis();
+      WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
       bufI2C[0] = buf[0];       //sender
       bufI2C[1] = 0;            //packages received
       bufI2C[2] = buf[1];       //package data value first byte

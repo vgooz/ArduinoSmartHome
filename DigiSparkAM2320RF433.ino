@@ -35,7 +35,6 @@ volatile byte watchdog_counter = 0;
 
 ISR(WDT_vect)
 {
-  WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
   watchdog_counter++;
 }
 
@@ -69,7 +68,12 @@ void loop() {
   sleep_cpu();
 
   // wake up here every 8 secs, counter was incremented by ISR
-  if (watchdog_counter < 5 ) return; // wait for 5 * 8 seconds
+  if (watchdog_counter < 5 ) 
+  {
+    WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
+    return; // wait for 5 * 8 seconds
+  }
+  
   watchdog_counter = 0;
 
   sleep_disable();
@@ -112,6 +116,7 @@ void loop() {
 
   PORTB &= ~(1 << PB1);    //replaces digitalWrite(pinLED, LOW);
 
+  WDTCR |= _BV(WDIE);       //Enable watchdog interrupts
   adc_disable();
   power_all_disable();
 }
